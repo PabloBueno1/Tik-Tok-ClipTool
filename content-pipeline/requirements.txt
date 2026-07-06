@@ -1,0 +1,7 @@
+faster-whisper
+moviepy
+opencv-python
+pydantic
+requests
+edge-tts
+piper-tts

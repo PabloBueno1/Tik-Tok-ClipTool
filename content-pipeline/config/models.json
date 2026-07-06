@@ -1,0 +1,19 @@
+{
+  "llm": {
+    "provider": "ollama",
+    "model": "qwen3:14b",
+    "endpoint": "http://localhost:11434/api/chat",
+    "fallback_provider": "anthropic",
+    "fallback_model": "claude-sonnet-4-6"
+  },
+  "transcription": {
+    "provider": "faster-whisper",
+    "model": "large-v3",
+    "device": "cuda"
+  },
+  "tts": {
+    "provider": "piper",
+    "voice": "en_US-libritts-high",
+    "fallback_provider": "edge-tts"
+  }
+}
