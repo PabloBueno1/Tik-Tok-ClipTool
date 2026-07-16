@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.pyc
+content-pipeline/.venv/
+
+# Media and per-run pipeline artifacts - only the folder structure is tracked
+content-pipeline/inputs/**
+!content-pipeline/inputs/**/
+!content-pipeline/inputs/**/.gitkeep
+content-pipeline/outputs/**
+!content-pipeline/outputs/**/
+!content-pipeline/outputs/**/.gitkeep
+content-pipeline/data/**
+!content-pipeline/data/**/
+!content-pipeline/data/**/.gitkeep

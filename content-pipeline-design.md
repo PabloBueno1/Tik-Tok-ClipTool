@@ -9,25 +9,31 @@ content-pipeline/
   inputs/
     source_videos/
     gameplay_loops/
+    pending_clips/
   outputs/
     drafts/
     approved/
     rejected/
   data/
+    ingest/
     transcripts/
     scripts/
     render_plans/
+    voice/
   config/
     models.json
     caption_presets.json
     effect_presets.json
   src/
+    common.py
     ingest.py
     transcribe.py
     plan_video.py
     generate_voice.py
     render.py
     review_queue.py
+    run_pipeline.py
+    split_movie.py
 ```
 
 Manual step: move an approved video from `outputs/approved/` and post it yourself.
@@ -91,10 +97,11 @@ The LLM outputs structured parameters, never code — ffmpeg/moviepy stays deter
 ```
 
 Notes:
-- `effects`, `caption_style`, `title_card` follow the same rule as everything else: the LLM picks which preset/timestamp, never raw filter math. Presets live in `config/effect_presets.json` / `.ass` style templates, so output stays deterministic and debuggable.
+- `caption_style`, `title_card` follow the same rule as everything else: the LLM picks which preset/timestamp, never raw filter math. Presets live in `config/effect_presets.json` / `.ass` style templates, so output stays deterministic and debuggable.
+- **Per-moment effects (screen_shake / color_grade / zoom_punch / flash_hit) were removed** after real-footage testing - they added noise, not retention. The edit language is now: clip-level Ken Burns zoom, transitions, cold-open teaser, hook overlay, karaoke captions.
 - **Captions**: text comes from the LLM script, but timing comes from a word-level forced-alignment pass over the *generated voiceover audio* (not the source video transcript — the source transcript is only for picking which source clips to use). `generate_voice.py` runs faster-whisper (or an aligner) on its own TTS output and saves word-level timestamps alongside the audio; that's what drives the `.ass` karaoke rendering. `emphasis_words` drives which words get punched up as they're spoken.
 - **B-roll**: no tagging/retrieval system — `render.py` randomly selects clips (or random offsets into longer loops) from `inputs/gameplay_loops/` to fill any gap in the output timeline that isn't covered by a source clip insert. `clips` entries are placed sequentially in the order given; b-roll auto-fills the space between/around them up to the total voiceover length. No explicit output-timestamp field needed unless a future need arises to pin a clip to an exact beat.
-- **Title card**: a held intro card (hook text, optional dimmed/blurred background) before the main cut, parameterized by `hook`.
+- **Hook overlay + cold open**: the hook text is overlaid top-center over the first few seconds while the video plays (no held intro card - content starts moving at frame zero, which is what short-form retention demands). Parameterized by `hook` (or a `title_card` override in the plan, kept for schema back-compat). If the plan includes `hook_clip` (the LLM's pick for the single most explosive 1.5-3s instant, allowed to land mid-sentence), that moment plays first as a cold-open teaser with its raw audio - payoff first, then the video from the beginning with the voiceover delayed behind it. An invalid `hook_clip` is repaired or dropped, never fatal.
 - All editing instruction fields are optional-with-defaults so the render step never breaks if the LLM omits one.
 
 ## 5. Tech Stack
@@ -182,9 +189,10 @@ Each stage is a self-contained checkpoint: build it, run it on a real test video
   - Extend the LLM prompt to populate these fields.
   - Checkpoint: toggle each effect type on a test video and visually confirm it applies correctly.
 
-- **Stage 7 — Review dashboard**
-  - Streamlit/FastAPI: list drafts, show render plan + video side by side, approve/reject buttons.
-  - Checkpoint: you can review and approve/reject a batch of drafts without touching the filesystem directly.
+- **Stage 7 — Orchestrator + long-form splitting**
+  - `split_movie.py`: cuts a long-form video (e.g. a full stream VOD) into highlight clips - transcribes the whole thing, then runs the transcript through the LLM in bounded time windows. The LLM picks moments by **segment index range** (never raw timestamps - cuts always land on real sentence boundaries by construction, and index ranges are auto-extended/trimmed to fit the 60-90s target) and scores each 1-10 against a rubric that explicitly downranks menu/loading/housekeeping chatter. Invalid picks are dropped individually rather than failing the whole window. Candidates below `--min-score` are filtered, overlaps resolved highest-score-wins, then a **global rerank pass** shows the LLM every surviving candidate side by side and keeps the best `--max-total-clips` for the whole video. An optional `--context` line (the video's title/game/streamer) is fed to both passes. If a chat replay file is present (`--chat`, or auto-detected `<video>.live_chat.json` from yt-dlp; `chat-downloader` JSON also supported - see `chat_signal.py`), chat message-rate eruptions (weighted toward reaction emotes/phrases, shifted back by the reaction lag) tag segments `[CHAT ERUPTED]` - the strongest clip-worthiness signal, since it also catches visual moments the transcript can't see. Clips are staged into `inputs/pending_clips/` along with a `{video}_highlights.json` manifest (each clip's source timestamps, score, excerpt + why it was picked). Exposes `split_into_highlights()`, which no-ops (returns the input path unchanged) for a video already at or under the max clip length.
+  - `run_pipeline.py`: run (split ->) ingest -> transcribe -> plan -> voice -> render end to end. Given a single video file, it calls `split_into_highlights()` first - long-form files fan out into their picked highlight clips and each one runs through the full pipeline; a file already clip-length runs through as-is (or pass `--no-split` to force treating it as one clip). Given a directory, it loops the full pipeline over every video already inside it (the manual path for clips split earlier, reviewed, and staged by hand).
+  - Checkpoint: `run_pipeline.py --video <long-form file> --title "..."` splits into clean, on-topic highlight clips and runs every one through the full pipeline in a single command; `run_pipeline.py --video inputs/pending_clips` still works for a pre-staged directory.
 
 - **Stage 8 — Manual posting**
   - Approved videos land in `outputs/approved/` — you post them yourself.

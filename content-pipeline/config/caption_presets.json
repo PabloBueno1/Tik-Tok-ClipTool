@@ -1,0 +1,30 @@
+{
+  "bold_yellow_pop": {
+    "font_name": "Arial Black",
+    "font_size": 88,
+    "primary_color": "&H00FFFFFF",
+    "highlight_color": "&H0000FFFF",
+    "outline_color": "&H00000000",
+    "back_color": "&H00000000",
+    "outline": 5,
+    "shadow": 0,
+    "bold": true,
+    "alignment": 5,
+    "margin_v": 60,
+    "scale_pop": 1.18
+  },
+  "minimal_white_bottom": {
+    "font_name": "Arial",
+    "font_size": 60,
+    "primary_color": "&H00FFFFFF",
+    "highlight_color": "&H00FFFF00",
+    "outline_color": "&H00000000",
+    "back_color": "&H00000000",
+    "outline": 2,
+    "shadow": 0,
+    "bold": false,
+    "alignment": 2,
+    "margin_v": 140,
+    "scale_pop": 1.08
+  }
+}

@@ -2,9 +2,7 @@
   "llm": {
     "provider": "ollama",
     "model": "qwen3:14b",
-    "endpoint": "http://localhost:11434/api/chat",
-    "fallback_provider": "anthropic",
-    "fallback_model": "claude-sonnet-4-6"
+    "endpoint": "http://localhost:11434/api/chat"
   },
   "transcription": {
     "provider": "faster-whisper",
@@ -13,7 +11,13 @@
   },
   "tts": {
     "provider": "piper",
-    "voice": "en_US-libritts-high",
+    "voices": [
+      "en_US-libritts-high",
+      "en_US-lessac-medium",
+      "en_US-amy-medium",
+      "en_US-ryan-high",
+      "en_GB-alan-medium"
+    ],
     "fallback_provider": "edge-tts"
   }
 }

@@ -1,7 +1,8 @@
 faster-whisper
 moviepy
-opencv-python
+opencv-python<5  # pinned below 5.x: that line dropped the bundled Haar cascade data detect_cam.py relies on
 pydantic
 requests
 edge-tts
 piper-tts
+yt-dlp
