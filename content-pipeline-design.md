@@ -49,6 +49,8 @@ Manual step: move an approved video from `outputs/approved/` and post it yoursel
 - **Review queue** — you look at it and approve/reject.
 - **Post manually.**
 
+**Raw mode** (`run_pipeline.py --raw`): skips voiceover/script/b-roll entirely — full-frame 9:16 clip with the streamer's own audio, karaoke captions from the source transcript's word timestamps, hook overlay, cold-open teaser (must start ≥15s into the clip). Added after the TTS-narrated split-screen format showed 0-2s retention on TikTok: a synthetic narrator over streamer content reads as clip-farm slop, while the streamer's own reaction IS the product. Both modes share selection and the hook system (LLM writes 5 hook options ≤12 words, strongest first; `resolve_hook` picks the best fitting one).
+
 ## 3. Render Plan Schema (LLM Editing Instructions)
 The LLM outputs structured parameters, never code — ffmpeg/moviepy stays deterministic and consumes this JSON.
 

@@ -494,12 +494,149 @@ def render(record_id: str) -> Path:
     return final_path
 
 
+def build_raw_frame_filter(input_index: int, label_out: str, cam_region: dict | None) -> str:
+    """Full-frame 9:16 fit for raw mode: center-crop the source to fill the
+    vertical frame, then re-overlay the webcam bubble (which the center crop
+    of a 16:9 frame usually cuts off)."""
+    main_src = f"r{input_index}main" if cam_region else f"{input_index}:v"
+    parts = []
+    if cam_region:
+        parts.append(f"[{input_index}:v]split=2[{main_src}][r{input_index}camsrc]")
+
+    parts.append(
+        f"[{main_src}]scale={FRAME_WIDTH}:{FRAME_HEIGHT}:force_original_aspect_ratio=increase,"
+        f"crop={FRAME_WIDTH}:{FRAME_HEIGHT},setsar=1,setpts=PTS-STARTPTS[r{input_index}f]"
+    )
+    last = f"r{input_index}f"
+
+    if cam_region:
+        cam_x = f"iw*{cam_region['x_ratio']:.4f}"
+        cam_y = f"ih*{cam_region['y_ratio']:.4f}"
+        cam_w = f"iw*{cam_region['w_ratio']:.4f}"
+        cam_h = f"ih*{cam_region['h_ratio']:.4f}"
+        parts.append(
+            f"[r{input_index}camsrc]crop=w='{cam_w}':h='{cam_h}':x='{cam_x}':y='{cam_y}',"
+            f"scale={CAM_BUBBLE_WIDTH}:-2[r{input_index}cam]"
+        )
+        parts.append(
+            f"[{last}][r{input_index}cam]overlay=x=main_w-overlay_w-{CAM_MARGIN_PX}:y={CAM_MARGIN_PX}[r{input_index}camout]"
+        )
+        last = f"r{input_index}camout"
+
+    parts.append(f"[{last}]fps=30[{label_out}]")
+    return ";".join(parts)
+
+
+def run_ffmpeg_raw(
+    source_video: Path,
+    duration: float,
+    cold_open: dict | None,
+    ass_path: Path,
+    out_path: Path,
+    cam_region: dict | None = None,
+) -> None:
+    """Raw-mode render: (optional cold-open teaser +) the whole clip,
+    full-frame vertical, the streamer's own audio untouched, captions and
+    hook burned in. No voiceover, no b-roll, no split screen."""
+    cmd = ["ffmpeg", "-y"]
+    cold_dur = 0.0
+    if cold_open:
+        cold_dur = cold_open["source_end"] - cold_open["source_start"]
+        cmd += ["-ss", f"{cold_open['source_start']:.3f}", "-t", f"{cold_dur:.3f}", "-i", str(source_video)]
+    cmd += ["-i", str(source_video)]
+    main_index = 1 if cold_open else 0
+
+    filters = []
+    if cold_open:
+        filters.append(build_raw_frame_filter(0, "teaser", cam_region))
+    filters.append(build_raw_frame_filter(main_index, "body", cam_region))
+
+    if cold_open:
+        filters.append("[teaser][body]concat=n=2:v=1:a=0[joined]")
+        filters.append(f"[0:a]asetpts=PTS-STARTPTS[ateaser];[{main_index}:a]asetpts=PTS-STARTPTS[abody]")
+        filters.append("[ateaser][abody]concat=n=2:v=0:a=1[aout]")
+        video_in = "joined"
+    else:
+        filters.append(f"[{main_index}:a]anull[aout]")
+        video_in = "body"
+
+    ass_arg = str(ass_path).replace("\\", "/").replace(":", "\\:")
+    filters.append(f"[{video_in}]ass='{ass_arg}',format=yuv420p,fps=30[vout]")
+
+    cmd += [
+        "-filter_complex", ";".join(filters),
+        "-map", "[vout]",
+        "-map", "[aout]",
+        "-c:v", "h264_nvenc",
+        "-c:a", "aac",
+        "-t", f"{cold_dur + duration:.3f}",
+        str(out_path),
+    ]
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"ffmpeg raw render failed:\n{result.stderr}")
+
+
+def load_transcript_words(record_id: str) -> tuple[list[dict], float]:
+    from common import TRANSCRIPTS_DIR
+
+    with open(TRANSCRIPTS_DIR / f"{record_id}.json", "r", encoding="utf-8") as f:
+        transcript = json.load(f)
+    words = [
+        {"word": w["word"], "start": w["start"], "end": w["end"]}
+        for seg in transcript["segments"]
+        for w in seg.get("words", [])
+        if w["word"].strip()
+    ]
+    return words, transcript["duration"]
+
+
+def render_raw(record_id: str) -> Path:
+    """Raw mode: the clip IS the content - streamer's own voice/game audio at
+    full volume, full-frame vertical, karaoke captions of what's actually
+    said (from the source transcript's word timestamps), hook overlay, and
+    the cold-open teaser. No TTS narration, no b-roll."""
+    plan = load_render_plan(record_id)
+    ingest_record = load_ingest_record(record_id)
+    words, duration = load_transcript_words(record_id)
+
+    source_video = Path(ingest_record["video_path"])
+    preset = load_caption_preset(plan.get("caption_style", {}).get("preset", DEFAULT_CAPTION_PRESET))
+    hook_text = plan.get("hook") or (plan.get("hooks") or [""])[0]
+
+    cold_open = plan.get("hook_clip")
+    cold_dur = (cold_open["source_end"] - cold_open["source_start"]) if cold_open else 0.0
+    hook_duration = min(cold_dur + HOOK_DURATION_DEFAULT, cold_dur + duration)
+
+    DRAFTS_DIR.mkdir(parents=True, exist_ok=True)
+    ass_path = DRAFTS_DIR / f"{record_id}.ass"
+    ass_path.write_text(
+        build_ass(words, preset, hook_text, hook_duration, caption_offset=cold_dur),
+        encoding="utf-8",
+    )
+
+    final_path = DRAFTS_DIR / f"{record_id}.mp4"
+    run_ffmpeg_raw(
+        source_video=source_video,
+        duration=duration,
+        cold_open=cold_open,
+        ass_path=ass_path,
+        out_path=final_path,
+        cam_region=ingest_record.get("cam_region"),
+    )
+    return final_path
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Render the split-screen video with voiceover, karaoke captions, and a hook text overlay.")
+    parser = argparse.ArgumentParser(description="Render the final video (voiceover split-screen mode, or raw mode when the plan was made by plan_raw_and_save).")
     parser.add_argument("--id", required=True, help="Pipeline record id (shared across ingest/transcribe/plan/voice).")
     args = parser.parse_args()
 
-    print(render(args.id))
+    if load_render_plan(args.id).get("mode") == "raw":
+        print(render_raw(args.id))
+    else:
+        print(render(args.id))
 
 
 if __name__ == "__main__":

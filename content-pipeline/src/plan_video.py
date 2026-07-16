@@ -33,6 +33,15 @@ HOOK_CLIP_MIN_SECONDS = 3.0
 HOOK_CLIP_MAX_SECONDS = 6.0
 HOOK_CLIP_TRIM_SECONDS = 5.0
 
+# Hook text: overlaid on screen for ~3.5s - past this many words it can't be
+# read before it fades, and long hooks read as essay, not scroll-stopper.
+HOOK_MAX_WORDS = 12
+
+# Raw mode: the whole cut clip plays from its start right after the teaser,
+# so a teaser moment inside the clip's opening stretch would play twice
+# back-to-back - require the teased moment to sit at least this deep in.
+RAW_TEASER_MIN_START_SECONDS = 15.0
+
 ALLOWED_TRANSITIONS = {
     "hard_cut", "fade", "dissolve", "wipeleft", "wiperight",
     "slideup", "slidedown", "circleopen", "circleclose", "pixelize",
@@ -41,7 +50,7 @@ SYSTEM_PROMPT = f"""You are writing a render plan for a short vertical (9:16) co
 You will be given a transcript of a source video with segment timestamps. Some segments are tagged [LOUD REACTION] - the streamer's voice spiked well above their normal level there (an actual excited reaction). That's a bonus signal worth favoring when choosing between otherwise-similar moments, but most good clips won't have one - don't require it.
 Produce a JSON object with exactly these fields:
 - title: short internal title for the draft
-- hook: a punchy one-sentence hook to open the video - clip-farming clickbait energy. Overclaim a little, bait curiosity, pick a side. Aimed straight at the viewer ("you"), the kind of line that stops a scroll and makes someone need to know what happens. Not a neutral description of what happens in the clip.
+- hooks: a list of exactly 5 distinct hook options, ORDERED STRONGEST FIRST - each ONE punchy sentence of AT MOST 12 words, overlaid on screen as the video opens. Clip-farming clickbait energy: overclaim a little, bait curiosity, pick a side, aim straight at the viewer ("you") - the kind of line that stops a scroll. Never a neutral description. Vary the angle across the 5: shock, a question or challenge, a bold claim, direct address, an absurd specific detail.
 - hook_clip: {{"source_start": number, "source_end": number}} - the single most explosive 3-5 second moment in the transcript (the scream, the punchline, the moment of impact, plus a beat of buildup before it). It plays as a cold-open teaser before the video starts from the beginning - the viewer sees the payoff first, then stays to watch how it got there. Put the peak near the END of the teaser so it climaxes right before the cut; unlike clips below it does NOT need to land on segment boundaries.
   CRITICAL: the teased moment must fall inside one of your clips' ranges, but NEVER the FIRST clip - the video has to build up to the payoff, so the moment must resurface in a later clip (ideally past the midpoint of the sequence). If the teaser were followed immediately by the same footage again, the opening feels broken - structure your clips so earlier ones are buildup/context and the payoff lands late.
 - script: the full voiceover narration script, written to be read aloud. It must be substantial: at least {MIN_SCRIPT_WORDS} words, so it runs at least 60 seconds at a natural speaking pace. Do not pad with filler or repetition - add genuine additional reaction, context, or opinion to reach the length.
@@ -80,10 +89,34 @@ class HookClip(BaseModel):
 
 class RenderPlan(BaseModel):
     title: str
-    hook: str
+    hooks: list[str] = []
+    hook: str | None = None  # resolved from hooks during validation (kept for downstream/back-compat)
     script: str
     clips: list[Clip]
     hook_clip: HookClip | None = None
+
+
+class RawPlan(BaseModel):
+    """Raw mode: the clip plays with the streamer's own audio - no script,
+    no source-clip picking. The LLM only supplies packaging: title, hook
+    options, and the cold-open teaser pick."""
+    title: str
+    hooks: list[str] = []
+    hook: str | None = None
+    hook_clip: HookClip | None = None
+
+
+def resolve_hook(hooks: list[str], fallback: str | None) -> str:
+    """Picks the strongest usable hook: the model orders candidates
+    strongest-first, so take the first one short enough to be read before
+    the overlay fades; if none fit, the shortest candidate."""
+    candidates = [h.strip() for h in hooks if h and h.strip()]
+    if fallback and fallback.strip():
+        candidates.append(fallback.strip())
+    if not candidates:
+        raise ValueError("No hook provided - supply a 'hooks' list of 5 options (each at most 12 words).")
+    fitting = [h for h in candidates if len(h.split()) <= HOOK_MAX_WORDS]
+    return fitting[0] if fitting else min(candidates, key=lambda h: len(h.split()))
 
 
 def load_transcript(record_id: str) -> dict:
@@ -102,6 +135,7 @@ def format_transcript_for_prompt(transcript: dict) -> str:
 
 def validate_plan(raw_json: dict, duration: float, segments: list[dict]) -> RenderPlan:
     plan = RenderPlan.model_validate(raw_json)
+    plan.hook = resolve_hook(plan.hooks, plan.hook)
 
     word_count = len(plan.script.split())
     if word_count < MIN_SCRIPT_WORDS:
@@ -244,6 +278,78 @@ def plan_and_save(record_id: str) -> Path:
     script_path = SCRIPTS_DIR / f"{record_id}.txt"
     with open(script_path, "w", encoding="utf-8") as f:
         f.write(plan.script)
+
+    return plan_path
+
+
+RAW_SYSTEM_PROMPT = f"""You are packaging a raw streamer clip for TikTok/Shorts. The clip plays as-is with the streamer's own voice and game audio - you are NOT writing a script or narration. Your only job is the packaging around it.
+You will be given a timestamped transcript of the clip. Some segments are tagged [LOUD REACTION] - the streamer's voice spiked well above normal there.
+Produce a JSON object with exactly these fields:
+- title: short internal title for the draft
+- hooks: a list of exactly 5 distinct hook options, ORDERED STRONGEST FIRST - each ONE punchy sentence of AT MOST 12 words, overlaid on screen as the video opens. Clip-farming clickbait energy: overclaim a little, bait curiosity, pick a side, aim straight at the viewer ("you"). Never a neutral description. Vary the angle across the 5: shock, a question or challenge, a bold claim, direct address, an absurd specific detail.
+- hook_clip: {{"source_start": number, "source_end": number}} - the single most explosive 3-5 second moment (the scream, the punchline, the impact, plus a beat of buildup), played as a cold-open teaser before the clip runs from its start. Put the peak near the END of the teaser. CRITICAL: it must start at least {RAW_TEASER_MIN_START_SECONDS:.0f} seconds into the clip - the clip plays from the beginning right after the teaser, so teasing the opening would show the same footage twice back-to-back.
+Respond with ONLY the JSON object, no other text."""
+
+
+def validate_raw_plan(raw_json: dict, duration: float) -> RawPlan:
+    plan = RawPlan.model_validate(raw_json)
+    plan.hook = resolve_hook(plan.hooks, plan.hook)
+
+    if plan.hook_clip is not None:
+        hc = plan.hook_clip
+        hc.source_start = max(hc.source_start, 0.0)
+        hc.source_end = min(hc.source_end, duration)
+        if hc.source_end - hc.source_start > HOOK_CLIP_MAX_SECONDS:
+            hc.source_end = hc.source_start + HOOK_CLIP_TRIM_SECONDS
+        if hc.source_end - hc.source_start < HOOK_CLIP_MIN_SECONDS:
+            hc.source_start = max(hc.source_end - HOOK_CLIP_TARGET_SECONDS, 0.0)
+            hc.source_end = min(max(hc.source_start + HOOK_CLIP_TARGET_SECONDS, hc.source_end), duration)
+        # Teasing the clip's own opening plays the same footage twice - drop.
+        if hc.source_start < RAW_TEASER_MIN_START_SECONDS or hc.source_end - hc.source_start < 1.0:
+            plan.hook_clip = None
+
+    return plan
+
+
+def generate_raw_plan(record_id: str) -> RawPlan:
+    config = load_config()["llm"]
+    transcript = load_transcript(record_id)
+    flag_loud_segments(Path(transcript["audio_path"]), transcript["segments"])
+    transcript_text = format_transcript_for_prompt(transcript)
+
+    messages = [
+        {"role": "system", "content": "/no_think\n" + RAW_SYSTEM_PROMPT},
+        {"role": "user", "content": f"Transcript ({transcript['duration']:.0f}s total):\n{transcript_text}"},
+    ]
+
+    last_error = None
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        try:
+            content = call_llm(messages, config)
+        except requests.exceptions.RequestException as e:
+            last_error = e
+            continue
+        try:
+            raw_json = json.loads(content)
+            return validate_raw_plan(raw_json, transcript["duration"])
+        except (json.JSONDecodeError, ValidationError, ValueError) as e:
+            last_error = e
+            messages.append({"role": "assistant", "content": content})
+            messages.append({
+                "role": "user",
+                "content": f"That response was invalid: {e}\nPlease fix it and respond with ONLY the corrected JSON object.",
+            })
+
+    raise RuntimeError(f"LLM failed to produce a valid raw plan after {MAX_ATTEMPTS} attempts: {last_error}")
+
+
+def plan_raw_and_save(record_id: str) -> Path:
+    plan = generate_raw_plan(record_id)
+
+    RENDER_PLANS_DIR.mkdir(parents=True, exist_ok=True)
+    plan_path = RENDER_PLANS_DIR / f"{record_id}.json"
+    with open(plan_path, "w", encoding="utf-8") as f:
+        json.dump({**plan.model_dump(), "mode": "raw"}, f, indent=2)
 
     return plan_path
 
