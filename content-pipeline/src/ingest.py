@@ -16,7 +16,10 @@ def slugify(title: str) -> str:
     return slug or "clip"
 
 
-def ingest(video_path: Path, title: str, source: str) -> str:
+def ingest(video_path: Path, title: str, source: str, teaser: dict | None = None) -> str:
+    """teaser: optional {"start", "end"} in clip-local seconds - the measured
+    peak moment chosen by split_movie's moment re-centering, carried through
+    so the plan stage never has to (unreliably) rediscover it."""
     if not video_path.exists():
         raise FileNotFoundError(f"Video not found: {video_path}")
 
@@ -35,6 +38,7 @@ def ingest(video_path: Path, title: str, source: str) -> str:
         "original_path": str(video_path.resolve()),
         "video_path": str(dest_path.resolve()),
         "cam_region": detect_cam_region(dest_path),
+        "teaser": teaser,
         "ingested_at": datetime.now(timezone.utc).isoformat(),
     }
     record_path = INGEST_DIR / f"{record_id}.json"

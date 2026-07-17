@@ -1,4 +1,5 @@
 import argparse
+import json
 import sys
 import traceback
 from pathlib import Path
@@ -20,8 +21,27 @@ from split_movie import (
 from transcribe import transcribe
 
 
-def run_pipeline(video_path: Path, title: str, source: str, raw: bool = False) -> Path:
-    record_id = ingest(video_path, title, source)
+def load_manifest_teasers(clip_paths: list[Path]) -> dict[str, dict]:
+    """Collects per-clip teaser ranges from any *_highlights.json manifests
+    sitting next to the clips (written by split_movie's moment re-centering).
+    Keyed by clip filename; clips without an entry get no teaser handed in
+    and the plan stage falls back to finding one itself."""
+    teasers: dict[str, dict] = {}
+    for parent in {p.parent for p in clip_paths}:
+        for manifest_path in parent.glob("*_highlights.json"):
+            try:
+                with open(manifest_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except (json.JSONDecodeError, OSError):
+                continue
+            for entry in data.get("clips", []):
+                if entry.get("teaser"):
+                    teasers[entry["file"]] = entry["teaser"]
+    return teasers
+
+
+def run_pipeline(video_path: Path, title: str, source: str, raw: bool = False, teaser: dict | None = None) -> Path:
+    record_id = ingest(video_path, title, source, teaser=teaser)
     print(f"[1/5] Ingested: {record_id}")
 
     transcribe(record_id)
@@ -54,10 +74,11 @@ def run_many(video_paths: list[Path], title: str, source: str, raw: bool = False
     retries) is logged and skipped rather than aborting the rest of the batch."""
     outputs = []
     failures = []
+    teasers = load_manifest_teasers(video_paths)
     for i, video_path in enumerate(video_paths, start=1):
         print(f"--- {i}/{len(video_paths)}: {video_path.name} ---")
         try:
-            outputs.append(run_pipeline(video_path, f"{title} - {video_path.stem}", source, raw=raw))
+            outputs.append(run_pipeline(video_path, f"{title} - {video_path.stem}", source, raw=raw, teaser=teasers.get(video_path.name)))
         except Exception as e:
             print(f"FAILED on {video_path.name}: {e}", file=sys.stderr)
             traceback.print_exc()

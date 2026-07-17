@@ -40,6 +40,16 @@ CHAT_ANCHOR_TAIL_SECONDS = 12.0
 # edge to snap to it instead of using the raw time.
 EDGE_SNAP_TOLERANCE = 4.0
 
+# Moment-centric re-cut: every final clip is re-centered on its strongest
+# measured instant, giving buildup -> payoff-at-one-third -> aftermath, and a
+# guaranteed cold-open teaser around that instant recorded in the manifest.
+MOMENT_BUILDUP_SECONDS = 20.0
+TEASER_PRE_SECONDS = 3.0
+TEASER_POST_SECONDS = 1.5
+# A teaser starting earlier than this into the clip would replay as the clip
+# opens right after it (same rule the render's cold open enforces).
+MIN_TEASER_OFFSET_SECONDS = 15.0
+
 # Slack allowed ABOVE max_seconds after a clip's segment indices are
 # auto-extended/trimmed, since real sentence boundaries rarely land exactly
 # on the target lengths. min_seconds is a hard floor - platforms treat
@@ -332,6 +342,82 @@ def rerank_candidates(
     )
 
 
+def find_clip_moment(clip: dict, spikes: list[dict], segments: list[dict]) -> float:
+    """The clip's strongest measured instant (in VOD time): the biggest chat
+    eruption inside it, else the center of its longest loud-reaction run,
+    else just past the clip's midpoint (so a teaser still exists)."""
+    inside = [s for s in spikes if clip["start"] <= s["time"] <= clip["end"]]
+    if inside:
+        return max(inside, key=lambda s: s["weight"])["time"]
+
+    runs: list[list[dict]] = []
+    run: list[dict] = []
+    for seg in segments:
+        if seg["end"] < clip["start"] or seg["start"] > clip["end"]:
+            continue
+        if seg.get("loud"):
+            run.append(seg)
+        elif run:
+            runs.append(run)
+            run = []
+    if run:
+        runs.append(run)
+    if runs:
+        best = max(runs, key=lambda r: r[-1]["end"] - r[0]["start"])
+        return (best[0]["start"] + best[-1]["end"]) / 2
+
+    return (clip["start"] + clip["end"]) / 2
+
+
+def recenter_on_moment(
+    clip: dict, moment: float, video_duration: float,
+    min_seconds: float, max_seconds: float, segments: list[dict],
+) -> dict:
+    """Rebuilds the clip window around its peak moment - buildup before,
+    payoff at roughly the one-third mark, aftermath after - and attaches the
+    clip-local teaser range. The teaser is dropped (None) only when the
+    moment sits so close to the video's start that the buildup can't exist."""
+    length = min(max(clip["end"] - clip["start"], min_seconds), max_seconds)
+    start = moment - MOMENT_BUILDUP_SECONDS
+    start = max(min(start, video_duration - length), 0.0)
+    end = min(start + length, video_duration)
+
+    # Nudge edges onto nearby sentence boundaries when that keeps the length
+    # legal and the payoff far enough in.
+    starts = [s["start"] for s in segments]
+    ends = [s["end"] for s in segments]
+    near_start = min(starts, key=lambda b: abs(b - start))
+    if abs(near_start - start) <= EDGE_SNAP_TOLERANCE and moment - near_start >= MIN_TEASER_OFFSET_SECONDS + TEASER_PRE_SECONDS:
+        candidate_end = min(near_start + length, video_duration)
+        if candidate_end - near_start >= min_seconds:
+            start, end = near_start, candidate_end
+    near_end = min(ends, key=lambda b: abs(b - end))
+    if abs(near_end - end) <= EDGE_SNAP_TOLERANCE and min_seconds <= near_end - start <= max_seconds + LENGTH_TOLERANCE and near_end > moment + TEASER_POST_SECONDS:
+        end = near_end
+
+    teaser = None
+    t_start = moment - TEASER_PRE_SECONDS - start
+    t_end = min(moment + TEASER_POST_SECONDS, end) - start
+    if t_start >= MIN_TEASER_OFFSET_SECONDS and t_end - t_start >= 1.0:
+        teaser = {"start": round(t_start, 3), "end": round(t_end, 3)}
+
+    span = [s for s in segments if s["start"] < end and s["end"] > start]
+    excerpt = " ".join(s["text"] for s in span)
+    if len(excerpt) > EXCERPT_CHARS:
+        excerpt = excerpt[: EXCERPT_CHARS - 3] + "..."
+
+    return {
+        **clip,
+        "start": start,
+        "end": end,
+        "moment": moment,
+        "teaser": teaser,
+        "excerpt": excerpt or clip.get("excerpt", ""),
+        "loud": any(s.get("loud") for s in span),
+        "chat_spike": any(s.get("chat_spike") for s in span),
+    }
+
+
 def cut_clip(video_path: Path, start: float, end: float, out_path: Path) -> None:
     cmd = [
         "ffmpeg", "-y",
@@ -432,7 +518,16 @@ def split_into_highlights(
     strong = drop_overlaps(strong)
 
     accepted = rerank_candidates(strong, llm_config, duration, max_total_clips, context)
-    print(f"{len(candidates)} candidates -> {len(accepted)} final clips after scoring, overlap and rerank passes")
+    accepted = [
+        recenter_on_moment(c, find_clip_moment(c, spikes, segments), duration, min_seconds, max_seconds, segments)
+        for c in accepted
+    ]
+    accepted = drop_overlaps(accepted, min_spacing=0.0)
+    with_teaser = sum(1 for c in accepted if c["teaser"])
+    print(
+        f"{len(candidates)} candidates -> {len(accepted)} final clips after scoring, overlap and rerank passes "
+        f"({with_teaser} with a measured cold-open teaser)"
+    )
     if not accepted:
         raise RuntimeError(
             f"No highlight candidates in {video_path} scored {min_score:.0f}+ - "
@@ -450,6 +545,8 @@ def split_into_highlights(
             "file": out_path.name,
             "source_start": clip["start"],
             "source_end": clip["end"],
+            "moment": clip["moment"],
+            "teaser": clip["teaser"],
             "score": clip["score"],
             "reason": clip["reason"],
             "excerpt": clip["excerpt"],

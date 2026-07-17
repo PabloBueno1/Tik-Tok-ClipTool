@@ -1,12 +1,14 @@
 import argparse
 import json
 import re
+import wave
 from pathlib import Path
 
+import numpy as np
 import requests
 from pydantic import BaseModel, ValidationError
 
-from common import RENDER_PLANS_DIR, SCRIPTS_DIR, TRANSCRIPTS_DIR, call_llm, flag_loud_segments, load_config
+from common import RENDER_PLANS_DIR, SCRIPTS_DIR, TRANSCRIPTS_DIR, call_llm, flag_loud_segments, load_config, load_ingest_record
 
 MAX_ATTEMPTS = 5
 # The rendered video's length IS the voiceover's length (plus a few seconds
@@ -253,6 +255,17 @@ def generate_render_plan(record_id: str) -> RenderPlan:
         try:
             raw_json = json.loads(content)
             plan = validate_plan(raw_json, transcript["duration"], transcript["segments"])
+            # Teaser priority: the VOD-level measured pick from split_movie,
+            # else blend the LLM's pick with this clip's audio peaks. Either
+            # way the payoff must resurface in a non-first plan clip.
+            later_clip_ranges = [(c.source_start, c.source_end) for c in plan.clips[1:]]
+            handed_down = ingested_teaser(record_id)
+            if handed_down is not None and any(
+                lo <= (handed_down.source_start + handed_down.source_end) / 2 <= hi for lo, hi in later_clip_ranges
+            ):
+                plan.hook_clip = handed_down
+            elif later_clip_ranges:
+                plan.hook_clip = choose_teaser(plan.hook_clip, record_id, transcript["duration"], later_clip_ranges)
             return plan
         except (json.JSONDecodeError, ValidationError, ValueError) as e:
             last_error = e
@@ -311,6 +324,118 @@ def validate_raw_plan(raw_json: dict, duration: float) -> RawPlan:
     return plan
 
 
+def ingested_teaser(record_id: str) -> HookClip | None:
+    """The teaser split_movie measured at the VOD level and threaded through
+    ingest - the most trusted source, since it was chosen with chat + audio
+    signals the per-clip stages can't see. None for manually staged clips."""
+    try:
+        teaser = load_ingest_record(record_id).get("teaser")
+    except FileNotFoundError:
+        return None
+    if not teaser:
+        return None
+    return HookClip(source_start=teaser["start"], source_end=teaser["end"])
+
+
+def pick_peak_teaser(record_id: str, duration: float, allowed_ranges: list[tuple[float, float]] | None = None) -> HookClip | None:
+    """Deterministic cold-open pick: the clip's loudest audio moment (RMS
+    peak, i.e. the scream/laugh/impact) IS the teaser - measured, not
+    guessed, after LLM teaser picks kept being weak or landing in guarded
+    stretches. The peak sits near the teaser's end so it climaxes right
+    before the cut.
+
+    allowed_ranges restricts where the peak may come from: narrated mode
+    passes the non-first clips' source ranges (the teased payoff must
+    resurface later in the video); raw mode omits it and gets the default
+    guard - anywhere past the opening stretch the clip replays right after."""
+    audio_path = TRANSCRIPTS_DIR / f"{record_id}.wav"
+    if not audio_path.exists():
+        return None
+
+    with wave.open(str(audio_path), "rb") as wf:
+        sample_rate = wf.getframerate()
+        raw = wf.readframes(wf.getnframes())
+    samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32)
+    win = int(sample_rate * 0.5)
+    if samples.size < win:
+        return None
+    n = len(samples) // win
+    rms = np.sqrt(np.mean(samples[: n * win].reshape(n, win) ** 2, axis=1))
+
+    if allowed_ranges is None:
+        allowed_ranges = [(RAW_TEASER_MIN_START_SECONDS + 3.0, duration)]
+
+    centers = (np.arange(n) + 0.5) * 0.5
+    allowed = np.zeros(n, dtype=bool)
+    for lo, hi in allowed_ranges:
+        # The clip must still have somewhere to go after the peak.
+        allowed |= (centers >= lo) & (centers <= min(hi, duration - 1.5))
+    if not allowed.any():
+        return None
+
+    peak_idx = int(np.argmax(np.where(allowed, rms, -1.0)))
+    peak_t = float(centers[peak_idx])
+
+    start = max(peak_t - 3.0, 0.0)
+    end = min(peak_t + 1.5, duration)
+    if end - start < 1.0:
+        return None
+    return HookClip(source_start=start, source_end=end)
+
+
+def choose_teaser(
+    llm_pick: HookClip | None, record_id: str, duration: float,
+    allowed_ranges: list[tuple[float, float]] | None = None,
+) -> HookClip | None:
+    """Blends the two teaser signals: the LLM understands MEANING (punchline,
+    story beat) but proved unreliable alone; audio energy is measured truth
+    but only captures loud moments. Policy: keep the LLM's (already
+    guard-validated) pick when the audio backs it - a top peak lands in/near
+    it, or it at least has above-median energy (the calm-but-great story
+    beat). Otherwise use the loudest measured peak. A clip with no usable
+    audio profile keeps whatever the LLM gave."""
+    profile = _load_rms_profile(record_id)
+    if profile is None:
+        return llm_pick
+    centers, rms = profile
+
+    audio_pick = pick_peak_teaser(record_id, duration, allowed_ranges)
+    if llm_pick is None:
+        return audio_pick
+    if audio_pick is None:
+        return llm_pick
+
+    in_pick = (centers >= llm_pick.source_start) & (centers <= llm_pick.source_end)
+    near_pick = (centers >= llm_pick.source_start - 2.0) & (centers <= llm_pick.source_end + 2.0)
+    if not in_pick.any():
+        return audio_pick
+
+    top5 = np.argsort(rms)[-5:]
+    if near_pick[top5].any():
+        return llm_pick
+    if float(np.max(rms[in_pick])) >= float(np.median(rms)):
+        return llm_pick
+    return audio_pick
+
+
+def _load_rms_profile(record_id: str) -> tuple[np.ndarray, np.ndarray] | None:
+    """(window_center_seconds, rms) in 0.5s steps for the record's transcribed
+    audio, or None when the wav is missing/too short."""
+    audio_path = TRANSCRIPTS_DIR / f"{record_id}.wav"
+    if not audio_path.exists():
+        return None
+    with wave.open(str(audio_path), "rb") as wf:
+        sample_rate = wf.getframerate()
+        raw = wf.readframes(wf.getnframes())
+    samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32)
+    win = int(sample_rate * 0.5)
+    if win <= 0 or samples.size < win:
+        return None
+    n = len(samples) // win
+    rms = np.sqrt(np.mean(samples[: n * win].reshape(n, win) ** 2, axis=1))
+    return (np.arange(n) + 0.5) * 0.5, rms
+
+
 def generate_raw_plan(record_id: str) -> RawPlan:
     config = load_config()["llm"]
     transcript = load_transcript(record_id)
@@ -331,7 +456,15 @@ def generate_raw_plan(record_id: str) -> RawPlan:
             continue
         try:
             raw_json = json.loads(content)
-            return validate_raw_plan(raw_json, transcript["duration"])
+            plan = validate_raw_plan(raw_json, transcript["duration"])
+            # Teaser priority: the VOD-level measured pick from split_movie,
+            # else blend the LLM's pick with this clip's audio peaks.
+            handed_down = ingested_teaser(record_id)
+            if handed_down is not None:
+                plan.hook_clip = handed_down
+            else:
+                plan.hook_clip = choose_teaser(plan.hook_clip, record_id, transcript["duration"])
+            return plan
         except (json.JSONDecodeError, ValidationError, ValueError) as e:
             last_error = e
             messages.append({"role": "assistant", "content": content})
