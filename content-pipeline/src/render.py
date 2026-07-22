@@ -1,4 +1,5 @@
 import argparse
+import hashlib
 import json
 import random
 import subprocess
@@ -41,6 +42,15 @@ CAM_MARGIN_PX = 24
 
 VOICE_LEVEL = 0.25
 SOURCE_AUDIO_DUCK = 0.75
+
+# Raw mode: a continuous, barely-perceptible reframe (oversized crop +
+# fixed per-clip offset + a slow zoom drift over the whole render) so the
+# output isn't a pixel-identical crop of the source. Purely to change the
+# frame hash for platform content-matching - NOT a stylistic effect, no
+# per-moment punches/shakes/flashes. Keep both numbers small enough that a
+# viewer never consciously notices either one.
+RAW_REFRAME_MARGIN = 1.15
+RAW_ZOOM_END_SCALE = 1.06
 
 def load_render_plan(record_id: str) -> dict:
     path = RENDER_PLANS_DIR / f"{record_id}.json"
@@ -494,19 +504,43 @@ def render(record_id: str) -> Path:
     return final_path
 
 
-def build_raw_frame_filter(input_index: int, label_out: str, cam_region: dict | None) -> str:
-    """Full-frame 9:16 fit for raw mode: center-crop the source to fill the
-    vertical frame, then re-overlay the webcam bubble (which the center crop
-    of a 16:9 frame usually cuts off)."""
+def raw_offset_seed(record_id: str) -> tuple[float, float]:
+    """Deterministic per-clip crop offset direction in [-1, 1] x [-1, 1],
+    derived from the record id so re-rendering the same clip is stable."""
+    digest = hashlib.sha256(record_id.encode()).digest()
+    return (digest[0] / 255.0) * 2 - 1, (digest[1] / 255.0) * 2 - 1
+
+
+def build_raw_frame_filter(
+    input_index: int, label_out: str, cam_region: dict | None,
+    offset_frac: tuple[float, float], seg_duration: float,
+) -> str:
+    """Full-frame 9:16 fit for raw mode: oversized center-crop, then a slow
+    zoom drift (RAW_ZOOM_END_SCALE over seg_duration) cropped down to the
+    final frame with a small fixed offset from offset_frac - the reframe
+    described at RAW_REFRAME_MARGIN above. Then re-overlay the webcam bubble
+    (which the crop of a 16:9 frame usually cuts off)."""
+    over_w, over_h = FRAME_WIDTH * RAW_REFRAME_MARGIN, FRAME_HEIGHT * RAW_REFRAME_MARGIN
     main_src = f"r{input_index}main" if cam_region else f"{input_index}:v"
     parts = []
     if cam_region:
         parts.append(f"[{input_index}:v]split=2[{main_src}][r{input_index}camsrc]")
 
     parts.append(
-        f"[{main_src}]scale={FRAME_WIDTH}:{FRAME_HEIGHT}:force_original_aspect_ratio=increase,"
-        f"crop={FRAME_WIDTH}:{FRAME_HEIGHT},setsar=1,setpts=PTS-STARTPTS[r{input_index}f]"
+        f"[{main_src}]scale={over_w:.0f}:{over_h:.0f}:force_original_aspect_ratio=increase,"
+        f"crop={over_w:.0f}:{over_h:.0f},setsar=1,setpts=PTS-STARTPTS[r{input_index}s]"
     )
+    d = max(seg_duration, 0.01)
+    z = f"1.0+({RAW_ZOOM_END_SCALE}-1.0)*min(t/{d:.3f},1)"
+    parts.append(f"[r{input_index}s]scale=w='{over_w:.0f}*({z})':h='{over_h:.0f}*({z})':eval=frame[r{input_index}z]")
+
+    # Offset is a fraction of the margin's slack, well inside the clip()
+    # bound below so it never sits pinned at the frame edge.
+    off_x = offset_frac[0] * (over_w - FRAME_WIDTH) * 0.4
+    off_y = offset_frac[1] * (over_h - FRAME_HEIGHT) * 0.4
+    x_expr = f"clip((in_w-{FRAME_WIDTH})*0.5+({off_x:.1f}),0,in_w-{FRAME_WIDTH})"
+    y_expr = f"clip((in_h-{FRAME_HEIGHT})*0.5+({off_y:.1f}),0,in_h-{FRAME_HEIGHT})"
+    parts.append(f"[r{input_index}z]crop={FRAME_WIDTH}:{FRAME_HEIGHT}:x='{x_expr}':y='{y_expr}'[r{input_index}f]")
     last = f"r{input_index}f"
 
     if cam_region:
@@ -534,10 +568,12 @@ def run_ffmpeg_raw(
     ass_path: Path,
     out_path: Path,
     cam_region: dict | None = None,
+    offset_frac: tuple[float, float] = (0.0, 0.0),
 ) -> None:
     """Raw-mode render: (optional cold-open teaser +) the whole clip,
     full-frame vertical, the streamer's own audio untouched, captions and
-    hook burned in. No voiceover, no b-roll, no split screen."""
+    hook burned in. No voiceover, no b-roll, no split screen. offset_frac
+    drives the anti-fingerprint reframe in build_raw_frame_filter."""
     cmd = ["ffmpeg", "-y"]
     cold_dur = 0.0
     if cold_open:
@@ -548,8 +584,8 @@ def run_ffmpeg_raw(
 
     filters = []
     if cold_open:
-        filters.append(build_raw_frame_filter(0, "teaser", cam_region))
-    filters.append(build_raw_frame_filter(main_index, "body", cam_region))
+        filters.append(build_raw_frame_filter(0, "teaser", cam_region, offset_frac, cold_dur))
+    filters.append(build_raw_frame_filter(main_index, "body", cam_region, offset_frac, duration))
 
     if cold_open:
         filters.append("[teaser][body]concat=n=2:v=1:a=0[joined]")
@@ -622,6 +658,7 @@ def render_raw(record_id: str) -> Path:
         duration=duration,
         cold_open=cold_open,
         ass_path=ass_path,
+        offset_frac=raw_offset_seed(record_id),
         out_path=final_path,
         cam_region=ingest_record.get("cam_region"),
     )

@@ -51,6 +51,8 @@ Manual step: move an approved video from `outputs/approved/` and post it yoursel
 
 **Raw mode** (`run_pipeline.py --raw`): skips voiceover/script/b-roll entirely — full-frame 9:16 clip with the streamer's own audio, karaoke captions from the source transcript's word timestamps, hook overlay, cold-open teaser (must start ≥15s into the clip). Added after the TTS-narrated split-screen format showed 0-2s retention on TikTok: a synthetic narrator over streamer content reads as clip-farm slop, while the streamer's own reaction IS the product. Both modes share selection and the hook system (LLM writes 5 hook options ≤12 words, strongest first; `resolve_hook` picks the best fitting one).
 
+Raw mode also applies a continuous anti-fingerprint reframe (`RAW_REFRAME_MARGIN`/`RAW_ZOOM_END_SCALE` in `render.py`): an oversized crop with a small deterministic per-clip offset (`raw_offset_seed`, hashed from the record id) plus a slow, barely-visible zoom drift across the whole render. Added after raw-mode posts got 0 views for days while heavily-transformed narrated posts got normal distribution - the working theory is platform content-matching fingerprinting near-unmodified streamer footage and killing distribution before anyone sees it. This is deliberately NOT a stylistic effect (no per-moment punches/shakes/flashes, which were removed for reading as gimmicky) - it exists purely to change the frame hash.
+
 ## 3. Render Plan Schema (LLM Editing Instructions)
 The LLM outputs structured parameters, never code — ffmpeg/moviepy stays deterministic and consumes this JSON.
 
