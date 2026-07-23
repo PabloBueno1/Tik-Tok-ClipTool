@@ -40,6 +40,15 @@ CHAT_ANCHOR_TAIL_SECONDS = 12.0
 # edge to snap to it instead of using the raw time.
 EDGE_SNAP_TOLERANCE = 4.0
 
+# The rerank LLM call is a single stochastic draw and its own prompt tells it
+# to "keep fewer if the rest are weak" - on one run against a near-identical
+# candidate pool it kept 10 of 47, on another (same pool, same prompt) it
+# kept 2. Since the pool going into rerank is already spacing-deduped
+# (drop_overlaps before this stage), any subset of it stays valid, so a
+# floor can be backfilled from the runner-up candidates cheaply and safely -
+# the rerank still gets to cut hard, just never past half the target.
+RERANK_MIN_KEEP_FRACTION = 0.5
+
 # Moment-centric re-cut: every final clip is re-centered on its strongest
 # measured instant, giving buildup -> payoff-at-one-third -> aftermath, and a
 # guaranteed cold-open teaser around that instant recorded in the manifest.
@@ -290,15 +299,31 @@ def anchor_chat_candidates(
     return anchored
 
 
+def backfill_to_floor(selected: list[dict], candidates: list[dict], min_keep: int) -> list[dict]:
+    """Tops up a rerank result that came back too thin with the next-best
+    runner-up candidates (by candidate_rank_key). Safe without any spacing
+    check because candidates is already a spacing-deduped pool (drop_overlaps
+    ran before rerank_candidates was ever called) - any subset stays valid."""
+    if len(selected) >= min_keep:
+        return selected
+    selected_ids = {id(c) for c in selected}
+    runners_up = sorted((c for c in candidates if id(c) not in selected_ids), key=candidate_rank_key, reverse=True)
+    topped_up = selected + runners_up[: min_keep - len(selected)]
+    return sorted(topped_up, key=lambda c: c["start"])
+
+
 def rerank_candidates(
     candidates: list[dict], config: dict, video_duration: float, max_total: int, context: str | None,
 ) -> list[dict]:
     """Second LLM pass over every surviving candidate from every window: with
     the whole video's picks side by side it keeps the strongest max_total and
     drops filler that looked passable in its own window. Falls back to a plain
-    score sort if the LLM can't produce a usable answer."""
+    score sort if the LLM can't produce a usable answer. Backfilled up to
+    RERANK_MIN_KEEP_FRACTION of max_total if the LLM's cut was too thin - see
+    backfill_to_floor."""
     if len(candidates) <= max_total:
         return candidates
+    min_keep = max(1, min(max_total, round(max_total * RERANK_MIN_KEEP_FRACTION)))
 
     lines = []
     for i, c in enumerate(candidates):
@@ -333,7 +358,15 @@ def rerank_candidates(
             continue
         keep = [i for i in dict.fromkeys(parsed.keep) if 0 <= i < len(candidates)]
         if keep:
-            return sorted((candidates[i] for i in keep[:max_total]), key=lambda c: c["start"])
+            selected = [candidates[i] for i in keep[:max_total]]
+            if len(selected) < min_keep:
+                print(
+                    f"rerank kept only {len(selected)}/{len(candidates)} (floor is {min_keep}) - "
+                    f"backfilling with runner-up candidates",
+                    file=sys.stderr,
+                )
+                selected = backfill_to_floor(selected, candidates, min_keep)
+            return sorted(selected, key=lambda c: c["start"])
 
     print("warning: rerank pass failed, falling back to keeping the top-ranked candidates", file=sys.stderr)
     return sorted(
@@ -516,13 +549,18 @@ def split_into_highlights(
     if len(strong) < len(candidates):
         print(f"dropped {len(candidates) - len(strong)} candidate(s) scoring below {min_score:.0f}")
     strong = drop_overlaps(strong)
+    print(f"{len(strong)} candidate(s) survive scoring + spacing, entering rerank")
 
     accepted = rerank_candidates(strong, llm_config, duration, max_total_clips, context)
+    print(f"rerank kept {len(accepted)} of {len(strong)}")
     accepted = [
         recenter_on_moment(c, find_clip_moment(c, spikes, segments), duration, min_seconds, max_seconds, segments)
         for c in accepted
     ]
+    pre_recenter_dedup = len(accepted)
     accepted = drop_overlaps(accepted, min_spacing=0.0)
+    if len(accepted) < pre_recenter_dedup:
+        print(f"moment re-centering pulled {pre_recenter_dedup - len(accepted)} clip(s) into overlap with another - dropped")
     with_teaser = sum(1 for c in accepted if c["teaser"])
     print(
         f"{len(candidates)} candidates -> {len(accepted)} final clips after scoring, overlap and rerank passes "
